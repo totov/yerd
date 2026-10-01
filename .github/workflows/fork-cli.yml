@@ -1,0 +1,116 @@
+name: Fork CLI prerelease
+
+on:
+  push:
+    branches: [fork-cli-build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cli-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    if: github.repository == 'totov/yerd'
+    name: CLI (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: Linux_x86_64
+          - runner: ubuntu-24.04-arm
+            platform: Linux_arm64
+          - runner: macos-15
+            platform: macOS_arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show pinned toolchain and host
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          uname -sm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fork-cli-${{ matrix.platform }}
+
+      - name: Verify private CA trust and untrusted certificate rejection
+        run: cargo test --locked -p yerdd --lib php_install::tests::reqwest_downloader
+
+      - name: Build the three CLI binaries
+        run: cargo build --release --locked -p yerd -p yerdd -p yerd-helper
+
+      - name: Package sibling binaries
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging dist
+          cp target/release/yerd target/release/yerdd target/release/yerd-helper staging/
+          tar -czf "dist/Yerd_CLI_${PLATFORM}_${SOURCE_SHA}.tar.gz" -C staging yerd yerdd yerd-helper
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'totov/yerd'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish an immutable fork prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for platform in Linux_x86_64 Linux_arm64 macOS_arm64; do
+            test -f "Yerd_CLI_${platform}_${SOURCE_SHA}.tar.gz"
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+          tag="cli-${SOURCE_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace its assets."
+            exit 1
+          fi
+          cat > release-notes.md <<EOF
+          Fork CLI build with native system certificate trust enabled alongside Mozilla roots.
+
+          Source repository: https://github.com/${GH_REPO}
+          Source commit: ${SOURCE_SHA}
+          Build and regression tests: ${RUN_URL}
+
+          Each archive contains yerd, yerdd, and yerd-helper from this same commit. Extract all three binaries into the same directory. Verify the archive against SHA256SUMS before installation.
+
+          This is a fork prerelease, with no GUI application or upstream release signatures. TLS certificate and hostname verification remain enabled.
+          EOF
+          gh release create "$tag" \
+            --target "$SOURCE_SHA" \
+            --prerelease \
+            --title "Yerd CLI fork build ${SOURCE_SHA}" \
+            --notes-file release-notes.md \
+            ./*.tar.gz SHA256SUMS
